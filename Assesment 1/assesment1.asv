@@ -270,7 +270,7 @@ disp('Blob selection complete.');
 % multicoloured stripes produce high H variance while uniform walls and
 % sky do not. Only triggered when selected blob mean saturation < 0.30.
 
-winSize           = 2 * round(0.026 * imgH) + 1;
+winSize           = 2 * round(0.02 * imgH) + 1;
 low_sat_threshold = 0.30;
 
 for i = 1:numImages
@@ -346,8 +346,8 @@ for i = 1:numImages
         continue;
     end
 
-    % Expand bounding box by 13% to capture context around the blob
-    margin = round(0.13 * min(rows, cols));
+    % Expand bounding box by 8% to capture context around the blob
+    margin = round(0.08 * min(rows, cols));
     bb     = stats(1).BoundingBox;
     x1 = max(1,    floor(bb(1)) - margin);
     y1 = max(1,    floor(bb(2)) - margin);
@@ -355,7 +355,7 @@ for i = 1:numImages
     y2 = min(rows, floor(bb(2) + bb(4)) + margin);
 
     S_local    = S(y1:y2, x1:x2);
-    t_local    = 0.780 * otsu_threshold(S);
+    t_local    = 0.60 * otsu_threshold(S);
     local_mask = S_local > t_local;
 
     CC_local = bwconncomp(local_mask);
