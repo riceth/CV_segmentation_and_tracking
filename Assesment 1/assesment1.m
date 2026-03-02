@@ -62,7 +62,7 @@ disp('RGB to HSV conversion complete.');
 % regardless of input resolution.
 
 [imgH, imgW, ~] = size(X{1});
-sigma  = 0.0051 * imgH;
+sigma  = 0.0067 * imgH;
 kSize  = 2 * ceil(3 * sigma) + 1;  % odd-sized kernel covering 99.7% of distribution
 k      = floor(kSize / 2);
 [kx, ky] = meshgrid(-k:k, -k:k);
@@ -172,34 +172,6 @@ end
 disp('Hole filling complete.');
 
 %% =========================================================
-%  FIGURES 1 & 2: Pipeline Visualisations (Image 1)
-%  =========================================================
-
-% Compute V-only Otsu mask for Figure 1 comparison only
-t_V_fig    = otsu_threshold(V_smooth{1});
-mask_V_fig = V_smooth{1} > t_V_fig;
-
-% Figure 1: Channel analysis - shows why S is chosen over V
-figure('Name', 'Figure 1 - Channel Analysis');
-subplot(2,2,1); imshowpair(S_all{1},   S_smooth{1},              'montage');
-title('S channel: Original (left) | Smoothed (right)');
-subplot(2,2,2); imshowpair(V_all{1},   V_smooth{1},              'montage');
-title('V channel: Original (left) | Smoothed (right)');
-subplot(2,2,3); imshowpair(mask{1},    logical(Y{1}(:,:,1)),     'montage');
-title('S-only Otsu mask (left) | Ground Truth (right)');
-subplot(2,2,4); imshowpair(mask_V_fig, logical(Y{1}(:,:,1)),     'montage');
-title('V-only Otsu mask (left) | Ground Truth (right)');
-sgtitle('Figure 1: Channel Analysis - Image 1');
-
-% Figure 2: Post-processing stages
-figure('Name', 'Figure 2 - Post-Processing Stages');
-subplot(1,2,1); imshowpair(mask{1},       mask_clean{1},  'montage');
-title('Before blob removal (left) | After blob removal (right)');
-subplot(1,2,2); imshowpair(mask_clean{1}, mask_filled{1}, 'montage');
-title('Before fill holes (left) | After fill holes (right)');
-sgtitle('Figure 2: Post-Processing Stages - Image 1');
-
-%% =========================================================
 %  STEP 7: Blob Selection
 %  =========================================================
 % After thresholding, multiple candidate blobs remain. The parachute
@@ -214,6 +186,7 @@ sgtitle('Figure 2: Post-Processing Stages - Image 1');
 %             Blobs with centroids in the lower half are penalised.
 
 mask_final = cell(1, numImages);
+seClean    = strel('disk', round(0.01 * imgH));
 
 for i = 1:numImages
 
@@ -256,7 +229,7 @@ for i = 1:numImages
     [~, best_idx]  = max(score);
     mask_final{i}  = false(size(BW));
     mask_final{i}(CC.PixelIdxList{best_idx}) = true;
-
+    mask_final{i} = imopen(mask_final{i}, seClean); % imopen removes thin protrusions from the selected blob while preserving the compact core
 end
 
 disp('Blob selection complete.');
@@ -270,7 +243,7 @@ disp('Blob selection complete.');
 % multicoloured stripes produce high H variance while uniform walls and
 % sky do not. Only triggered when selected blob mean saturation < 0.30.
 
-winSize           = 2 * round(0.026 * imgH) + 1;
+winSize           = 2 * round(0.025 * imgH) + 1;
 low_sat_threshold = 0.30;
 
 for i = 1:numImages
@@ -346,8 +319,8 @@ for i = 1:numImages
         continue;
     end
 
-    % Expand bounding box by 13% to capture context around the blob
-    margin = round(0.13 * min(rows, cols));
+    % Expand bounding box by 7% to capture context around the blob
+    margin = round(0.07 * min(rows, cols));
     bb     = stats(1).BoundingBox;
     x1 = max(1,    floor(bb(1)) - margin);
     y1 = max(1,    floor(bb(2)) - margin);
@@ -355,7 +328,7 @@ for i = 1:numImages
     y2 = min(rows, floor(bb(2) + bb(4)) + margin);
 
     S_local    = S(y1:y2, x1:x2);
-    t_local    = 0.780 * otsu_threshold(S);
+    t_local    = 0.78 * otsu_threshold(S);
     local_mask = S_local > t_local;
 
     CC_local = bwconncomp(local_mask);
@@ -445,24 +418,43 @@ xlim([0 numImages + 1]);
 grid on;
 
 %% =========================================================
-%  STEP 12: Best and Worst Segmentation Visualisation
+%  STEP 12: Five Best and Five Worst Segmentation Results
 %  =========================================================
 
-[~, best_img]  = max(dice_scores);
-[~, worst_img] = min(dice_scores);
+[~, sorted_idx] = sort(dice_scores, 'descend');
+best_five  = sorted_idx(1:5);
+worst_five = sorted_idx(end-4:end);
 
-figure('Name', 'Figure 4 - Best and Worst Segmentation');
+% --- Five Best Results ---
+for j = 1:5
+    idx = best_five(j);
+    figure('Name', ['Best ' num2str(j) ' - Image ' num2str(idx)]);
+    subplot(1,3,1);
+    imshow(mask_refined{idx});
+    title('Predicted');
+    subplot(1,3,2);
+    imshow(logical(Y{idx}(:,:,1)));
+    title('Ground Truth');
+    subplot(1,3,3);
+    imshowpair(mask_refined{idx}, logical(Y{idx}(:,:,1)));
+    title('Overlay');
+    sgtitle(['Best #' num2str(j) ' - Image ' num2str(idx) ...
+             '  |  DSC = ' num2str(dice_scores(idx), '%.4f')]);
+end
 
-subplot(2,1,1);
-imshowpair(mask_refined{best_img}, logical(Y{best_img}(:,:,1)), 'montage');
-title(['Best - Image ' num2str(best_img) ...
-       '  DSC = ' num2str(dice_scores(best_img), '%.3f') ...
-       '  |  Predicted (left)  |  Ground Truth (right)']);
-
-subplot(2,1,2);
-imshowpair(mask_refined{worst_img}, logical(Y{worst_img}(:,:,1)), 'montage');
-title(['Worst - Image ' num2str(worst_img) ...
-       '  DSC = ' num2str(dice_scores(worst_img), '%.3f') ...
-       '  |  Predicted (left)  |  Ground Truth (right)']);
-
-sgtitle('Figure 4: Best and Worst Segmentation Results');
+% --- Five Worst Results ---
+for j = 1:5
+    idx = worst_five(j);
+    figure('Name', ['Worst ' num2str(j) ' - Image ' num2str(idx)]);
+    subplot(1,3,1);
+    imshow(mask_refined{idx});
+    title('Predicted');
+    subplot(1,3,2);
+    imshow(logical(Y{idx}(:,:,1)));
+    title('Ground Truth');
+    subplot(1,3,3);
+    imshowpair(mask_refined{idx}, logical(Y{idx}(:,:,1)));
+    title('Overlay');
+    sgtitle(['Worst #' num2str(j) ' - Image ' num2str(idx) ...
+             '  |  DSC = ' num2str(dice_scores(idx), '%.4f')]);
+end
