@@ -139,21 +139,26 @@ disp('Otsu thresholding complete.');
 %% =========================================================
 %  STEP 5: Remove Small Blobs
 %  =========================================================
-% Connected components below 0.5% of total image area are noise -
-% isolated high-saturation pixels unrelated to the parachute. The
-% threshold is image-relative so it generalises across resolutions.
-
-imageArea   = imgH * imgW;
-minBlobArea = round(0.005 * imageArea);
+% Blobs below the median area of all detected components are more likely
+% noise than signal. Using the median as a data-driven threshold avoids
+% any hardcoded size constant while adapting to each image's content.
 
 mask_clean = cell(1, numImages);
 
 for i = 1:numImages
+    stats    = regionprops(mask{i}, 'Area');
+    allAreas = [stats.Area];
+
+    if isempty(allAreas)
+        mask_clean{i} = mask{i};
+        continue;
+    end
+
+    minBlobArea   = max(1, round(median(allAreas)));
     mask_clean{i} = bwareaopen(mask{i}, minBlobArea);
 end
 
-disp(['Small blob removal complete. Min area: ', num2str(minBlobArea), ...
-      ' px (0.5% of image)']);
+disp('Small blob removal complete (median adaptive threshold).');
 
 %% =========================================================
 %  STEP 6: Fill Holes
@@ -186,7 +191,7 @@ disp('Hole filling complete.');
 %             Blobs with centroids in the lower half are penalised.
 
 mask_final = cell(1, numImages);
-seClean    = strel('disk', round(0.01 * imgH));
+
 
 for i = 1:numImages
 
@@ -204,32 +209,41 @@ for i = 1:numImages
     stats        = regionprops(CC, 'Area', 'Solidity', 'PixelIdxList', 'Centroid');
     numBlobs     = CC.NumObjects;
 
-    maxAllowedArea = 0.25 * totalPixels;
     keep = true(1, numBlobs);
-    for k = 1:numBlobs
-        if stats(k).Area > maxAllowedArea
-            keep(k) = false;
-        end
-    end
-    % Release size filter if it eliminated every candidate
-    if sum(keep) == 0
-        keep = true(1, numBlobs);
-    end
-
     score = zeros(1, numBlobs);
+
+
+    img_half = rows / 2;  % geometric midpoint in pixels
+    full_w   = rows;      % maximum possible centroid distance from top
+
     for k = 1:numBlobs
         if ~keep(k), continue; end
         pixels  = CC.PixelIdxList{k};
-        cy_frac = stats(k).Centroid(2) / rows;
-        pos_w   = 1.0;
-        if cy_frac >= 0.5, pos_w = 0.5; end
-        score(k) = mean(S(pixels)) * stats(k).Solidity * pos_w;
+        cy_px   = stats(k).Centroid(2);  % centroid in pixels
+        pos_w   = full_w;                % default: upper half - full weight
+        if cy_px >= img_half
+            pos_w = img_half;            % lower half - half weight
+        end
+        pos_w_norm = pos_w / full_w;     % normalise to [0,1]
+        score(k)   = mean(S(pixels)) * stats(k).Solidity * pos_w_norm;
     end
+
+
+
 
     [~, best_idx]  = max(score);
     mask_final{i}  = false(size(BW));
     mask_final{i}(CC.PixelIdxList{best_idx}) = true;
-    mask_final{i} = imopen(mask_final{i}, seClean); % imopen removes thin protrusions from the selected blob while preserving the compact core
+
+
+
+        % SE size derived from the selected blob's own minor axis -
+    % scales naturally to the parachute size in each image
+    stats_se  = regionprops(mask_final{i}, 'MinorAxisLength');
+    seRadius  = max(1, round(stats_se(1).MinorAxisLength * 0.1));
+    seClean   = strel('disk', seRadius);
+    mask_final{i} = imopen(mask_final{i}, seClean);
+ % imopen removes thin protrusions from the selected blob while preserving the compact core
 end
 
 disp('Blob selection complete.');
@@ -243,8 +257,9 @@ disp('Blob selection complete.');
 % multicoloured stripes produce high H variance while uniform walls and
 % sky do not. Only triggered when selected blob mean saturation < 0.30.
 
-winSize           = 2 * round(0.025 * imgH) + 1;
-low_sat_threshold = 0.30;
+grey_saturation_limit = 0.30;
+
+winSize = 2 * round(sqrt(imgH)) + 1;
 
 for i = 1:numImages
 
@@ -255,7 +270,7 @@ for i = 1:numImages
     if isempty(selected_pixels), continue; end
 
     mean_sat_selected = mean(S(selected_pixels));
-    if mean_sat_selected >= low_sat_threshold, continue; end
+    if mean_sat_selected >= grey_saturation_limit, continue; end
 
     H         = H_all{i};
     hvar_map  = stdfilt(H, ones(winSize, winSize));
@@ -268,16 +283,21 @@ for i = 1:numImages
 
     stats_hvar  = regionprops(CC_hvar, 'Area', 'Solidity', 'Centroid', 'PixelIdxList');
     [rows, ~]   = size(BW);
-    totalPixels = rows * size(BW, 2);
     score_hvar  = zeros(1, CC_hvar.NumObjects);
+    img_half    = rows / 2;
+    full_w      = rows;
+
+    hvar_areas    = [stats_hvar.Area];
+    min_hvar_area = max(1, round(median(hvar_areas) * 0.01));
 
     for k = 1:CC_hvar.NumObjects
-        if stats_hvar(k).Area > 0.25 * totalPixels, continue; end
-        if stats_hvar(k).Area < 10, continue; end
-        cy_frac       = stats_hvar(k).Centroid(2) / rows;
-        pos_w         = 1.0;
-        if cy_frac >= 0.5, pos_w = 0.5; end
-        score_hvar(k) = stats_hvar(k).Solidity * pos_w;
+        if stats_hvar(k).Area < min_hvar_area, continue; end
+        cy_px  = stats_hvar(k).Centroid(2);
+        pos_w  = full_w;
+        if cy_px >= img_half
+            pos_w = img_half;
+        end
+        score_hvar(k) = stats_hvar(k).Solidity * (pos_w / full_w);
     end
 
     [best_score, best_hvar] = max(score_hvar);
@@ -291,7 +311,6 @@ for i = 1:numImages
 end
 
 disp('H variance fallback complete.');
-
 %% =========================================================
 %  STEP 9: Region-Growing Refinement
 %  =========================================================
@@ -306,6 +325,17 @@ disp('H variance fallback complete.');
 
 mask_refined = cell(1, numImages);
 
+% Compute adaptive refinement trigger from selected blob size distribution
+all_blob_areas = zeros(1, numImages);
+for i = 1:numImages
+    st = regionprops(mask_final{i}, 'Area');
+    if ~isempty(st)
+        all_blob_areas(i) = st(1).Area;
+    end
+end
+% Blobs significantly smaller than the median are likely under-segmented
+refinement_trigger = median(all_blob_areas(all_blob_areas > 0)) / (rows * cols);
+
 for i = 1:numImages
 
     BW           = mask_final{i};
@@ -314,14 +344,15 @@ for i = 1:numImages
     totalPixels  = rows * cols;
     stats        = regionprops(BW, 'Area', 'BoundingBox');
 
-    if isempty(stats) || stats(1).Area / totalPixels > 0.025
+    if isempty(stats) || stats(1).Area / totalPixels > refinement_trigger
         mask_refined{i} = BW;
         continue;
     end
 
     % Expand bounding box by 7% to capture context around the blob
-    margin = round(0.07 * min(rows, cols));
+% Margin derived from blob bounding box - expands by fraction of blob extent
     bb     = stats(1).BoundingBox;
+    margin = round(min(bb(3), bb(4)) / 2);  % half the smaller bbox dimension
     x1 = max(1,    floor(bb(1)) - margin);
     y1 = max(1,    floor(bb(2)) - margin);
     x2 = min(cols, floor(bb(1) + bb(3)) + margin);
