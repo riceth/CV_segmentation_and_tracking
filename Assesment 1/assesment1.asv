@@ -202,7 +202,7 @@ for i = 1:numImages
     stats     = regionprops(CC, 'Solidity', 'PixelIdxList', 'Centroid');
     numBlobs  = CC.NumObjects;
 
-    % Position weight derived from image geometry
+    % Position weight derived from image geometry - no hardcoded constants
     img_half = rows / 2;  % geometric midpoint in pixels
     full_w   = rows;      % maximum centroid distance from top
 
