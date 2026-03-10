@@ -71,11 +71,9 @@ gaussian_kernel = exp(-(kx.^2 + ky.^2) / (2 * sigma^2));
 gaussian_kernel = gaussian_kernel / sum(gaussian_kernel(:));  % unit sum preserves intensity range
 
 S_smooth = cell(1, numImages);
-V_smooth = cell(1, numImages);
 
 for i = 1:numImages
     S_smooth{i} = conv2(S_all{i}, gaussian_kernel, 'same');
-    V_smooth{i} = conv2(V_all{i}, gaussian_kernel, 'same');
 end
 
 disp(['Gaussian smoothing complete. Kernel: ', num2str(kSize), 'x', num2str(kSize), ...
@@ -289,6 +287,25 @@ for i = 1:numImages
             i, mean_sat_selected);
     end
 
+
+    if best_score > 0
+        mask_final{i} = false(size(BW));
+        mask_final{i}(CC_hvar.PixelIdxList{best_hvar}) = true;
+
+        % Contraction: remove low hue-variance pixels from selected blob
+        % Only applied here since fallback blobs tend to be oversized
+        hvar_blob  = hvar_norm(mask_final{i});
+        t_contract = otsu_threshold(reshape(hvar_blob, 1, []));
+        contracted = mask_final{i} & (hvar_norm > t_contract);
+        contracted = imfill(contracted, 'holes');
+        if sum(contracted(:)) > 0
+            mask_final{i} = contracted;
+        end
+
+        fprintf('Image %02d: H variance fallback triggered (mean_sat=%.3f)\n', ...
+            i, mean_sat_selected);
+    end
+
 end
 
 disp('H variance fallback complete.');
@@ -420,13 +437,10 @@ figure('Name', 'Figure 3 - DSC Results');
 bar(dice_scores, 'FaceColor', [0.22 0.48 0.74], 'EdgeColor', 'none');
 hold on;
 yline(mean_dice, 'r:', 'LineWidth', 1.2);
-text(numImages - 0.5, mean_dice + 0.025, ...
-    ['Mean = ' num2str(mean_dice, '%.3f')], ...
-    'Color', 'w', 'FontSize', 9, 'HorizontalAlignment', 'right');
 hold off;
 xlabel('Image Index');
 ylabel('Dice Similarity Coefficient');
-title('Parachute Segmentation - DSC per Image');
+title(['Parachute Segmentation - DSC per Image  |  Mean = ' num2str(mean_dice, '%.3f')]);
 ylim([0 1]);
 xlim([0 numImages + 1]);
 grid on;
@@ -443,26 +457,29 @@ worst_five = sorted_idx(end-4:end);
 for j = 1:5
     idx = best_five(j);
     figure('Name', ['Best ' num2str(j) ' - Image ' num2str(idx)]);
-    subplot(1,3,1); imshow(mask_refined{idx}); axis tight;
-    title('Predicted');
-    subplot(1,3,2); imshow(logical(Y{idx}(:,:,1))); axis tight;
-    title('Ground Truth');
-    subplot(1,3,3); imshowpair(mask_refined{idx}, logical(Y{idx}(:,:,1))); axis tight;
-    title('Overlay');
-    sgtitle(['Best #' num2str(j) ' - Image ' num2str(idx) ...
-             '  |  DSC = ' num2str(dice_scores(idx), '%.4f')]);
+    set(gcf, 'Color', 'w');
+    subplot(1,3,1); imshow(mask_refined{idx}); axis tight; axis image;
+    title('Predicted', 'FontSize', 8, 'Color', 'k');
+    subplot(1,3,2); imshow(logical(Y{idx}(:,:,1))); axis tight; axis image;
+    title(['Best #' num2str(j) ' - Image ' num2str(idx) '  |  DSC = ' num2str(dice_scores(idx), '%.4f')], 'FontSize', 8, 'Color', 'k');
+    subplot(1,3,3); imshowpair(mask_refined{idx}, logical(Y{idx}(:,:,1))); axis tight; axis image;
+    title('Overlay', 'FontSize', 8, 'Color', 'k');
 end
 
 % --- Five Worst Results ---
 for j = 1:5
     idx = worst_five(j);
     figure('Name', ['Worst ' num2str(j) ' - Image ' num2str(idx)]);
-    subplot(1,3,1); imshow(mask_refined{idx}); axis tight;
-    title('Predicted');
-    subplot(1,3,2); imshow(logical(Y{idx}(:,:,1))); axis tight;
-    title('Ground Truth');
-    subplot(1,3,3); imshowpair(mask_refined{idx}, logical(Y{idx}(:,:,1))); axis tight;
-    title('Overlay');
-    sgtitle(['Worst #' num2str(j) ' - Image ' num2str(idx) ...
-             '  |  DSC = ' num2str(dice_scores(idx), '%.4f')]);
+    set(gcf, 'Color', 'w');
+    subplot(1,3,1); imshow(mask_refined{idx}); axis tight; axis image;
+    title('Predicted', 'FontSize', 8, 'Color', 'k');
+    subplot(1,3,2); imshow(logical(Y{idx}(:,:,1))); axis tight; axis image;
+    title(['Worst #' num2str(j) ' - Image ' num2str(idx) '  |  DSC = ' num2str(dice_scores(idx), '%.4f')], 'FontSize', 8, 'Color', 'k');
+    subplot(1,3,3); imshowpair(mask_refined{idx}, logical(Y{idx}(:,:,1))); axis tight; axis image;
+    title('Overlay', 'FontSize', 8, 'Color', 'k');
 end
+
+
+
+
+

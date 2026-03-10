@@ -202,7 +202,7 @@ for i = 1:numImages
     stats     = regionprops(CC, 'Solidity', 'PixelIdxList', 'Centroid');
     numBlobs  = CC.NumObjects;
 
-    % Position weight derived from image geometry - no hardcoded constants
+    % Position weight derived from image geometry
     img_half = rows / 2;  % geometric midpoint in pixels
     full_w   = rows;      % maximum centroid distance from top
 
@@ -422,7 +422,19 @@ hold on;
 yline(mean_dice, 'r:', 'LineWidth', 1.2);
 text(numImages - 0.5, mean_dice + 0.025, ...
     ['Mean = ' num2str(mean_dice, '%.3f')], ...
-    'Color', 'w', 'FontSize', 9, 'HorizontalAlignment', 'right');
+    'Color', 'black', 'FontSize', 9, 'HorizontalAlignment', 'right');
+
+ax = gca;             % current axes
+xPos = numImages/2;   % choose x position on the mean line (replace with actual mean x if available)
+yBottom = ax.YLim(1);
+yOffset = 0.02 * diff(ax.YLim);   % 2% above bottom of axis
+text(xPos, yBottom + yOffset, ...
+    ['Mean = ' num2str(mean_dice, '%.3f')], ...
+    'Color', 'black', 'FontSize', 9, ...
+    'HorizontalAlignment', 'center', ...
+    'VerticalAlignment', 'bottom');
+
+
 hold off;
 xlabel('Image Index');
 ylabel('Dice Similarity Coefficient');
