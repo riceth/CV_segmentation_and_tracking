@@ -1,10 +1,5 @@
 % CMP9135M Computer Vision — Assessment 2
-% main.m : feature extraction + object tracking on the parachute dataset.
-%
-% Tools used in this file:
-%% Tool: GitHub CoPilot (free student version)
-%% Purpose: interactive code completion, e.g., function body skeletons,
-%%          variable and function names.
+% main.m : feature extraction + object tracking on the parachute dataset
 %
 % Run-order note: this script is self-contained. Execute from top to
 % bottom, or run individual %% cells after STEP 0 has been run once
