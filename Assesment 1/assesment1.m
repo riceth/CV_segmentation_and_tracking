@@ -1,485 +1,517 @@
-%% Parachute Segmentation Pipeline
-% CMP9135M Computer Vision - Assessment 1
-% Segments the parachute from 51 RGB images using classical CV only.
-clear; close all; clc;
-
-%% =========================================================
-%  STEP 1: Load Images and Ground Truths
-%  =========================================================
-
-image_list = dir('parachute/images/*.png');
-gt_list    = dir('parachute/GT/*.png');
-
-% Filesystem ordering is not guaranteed - sort explicitly
-[~, img_order] = sort({image_list.name});
-[~, gt_order]  = sort({gt_list.name});
-image_list = image_list(img_order);
-gt_list    = gt_list(gt_order);
-
-assert(length(image_list) == length(gt_list), ...
-    'Image and GT counts do not match - check folder structure.');
-
-numImages = length(image_list);
-X = cell(1, numImages);  % RGB images
-Y = cell(1, numImages);  % Ground truth masks
-
-for i = 1:numImages
-    X{i} = imread(fullfile('parachute/images', image_list(i).name));
-    Y{i} = imread(fullfile('parachute/GT',     gt_list(i).name));
-end
-
-disp(['Loaded ', num2str(numImages), ' image-GT pairs.']);
-
-%% =========================================================
-%  STEP 2: RGB to HSV Conversion
-%  =========================================================
-% HSV separates colour (H), vividness (S) and brightness (V) into
-% independent channels. The parachute is distinctively colourful (high S)
-% against a grey or dark background (low S). RGB conflates these
-% properties across three correlated channels, making thresholding harder.
-% rgb2hsv returns double in [0,1].
-
-H_all = cell(1, numImages);
-S_all = cell(1, numImages);
-V_all = cell(1, numImages);
-
-for i = 1:numImages
-    hsv_img  = rgb2hsv(X{i});
-    H_all{i} = hsv_img(:,:,1);  % Hue
-    S_all{i} = hsv_img(:,:,2);  % Saturation - primary segmentation channel
-    V_all{i} = hsv_img(:,:,3);  % Value
-end
-
-disp('RGB to HSV conversion complete.');
-
-%% =========================================================
-%  STEP 3: Gaussian Pre-Smoothing
-%  =========================================================
-% Smoothing before thresholding suppresses high-frequency sensor noise
-% that would otherwise produce speckle in the binary mask. The kernel is
-% built from scratch using the 2D Gaussian formula and applied via conv2.
-% Sigma is proportional to image height so the kernel scales correctly
-% regardless of input resolution.
-
-[imgH, imgW, ~] = size(X{1});
-sigma  = 0.0067 * imgH;
-kSize  = 2 * ceil(3 * sigma) + 1;  % odd-sized kernel covering 99.7% of distribution
-k      = floor(kSize / 2);
-[kx, ky] = meshgrid(-k:k, -k:k);
-
-gaussian_kernel = exp(-(kx.^2 + ky.^2) / (2 * sigma^2));
-gaussian_kernel = gaussian_kernel / sum(gaussian_kernel(:));  % unit sum preserves intensity range
-
-S_smooth = cell(1, numImages);
-
-for i = 1:numImages
-    S_smooth{i} = conv2(S_all{i}, gaussian_kernel, 'same');
-end
-
-disp(['Gaussian smoothing complete. Kernel: ', num2str(kSize), 'x', num2str(kSize), ...
-      ', Sigma: ', num2str(sigma, '%.3f'), ' px']);
-
-%% =========================================================
-%  STEP 4: Manual Otsu Thresholding
-%  =========================================================
-% Otsu's method finds the threshold that maximises inter-class variance,
-% which is equivalent to minimising intra-class variance. Global
-% thresholding works well here because the S histogram is bimodal -
-% the parachute forms a clear high-saturation peak against a low-
-% saturation background.
-
-function t = otsu_threshold(channel)
-    % Exhaustive search over all 256 threshold candidates.
-    % Maximises: inter_variance = w0 * w1 * (mu1 - mu0)^2
-    % Returns threshold t in [0,1] matching the input range.
-
-    channel_uint8 = uint8(channel * 255);
-    num_levels    = 256;
-    prob          = zeros(1, num_levels);
-
-    for intensity = 0:num_levels-1
-        prob(intensity + 1) = sum(channel_uint8(:) == intensity);
-    end
-    prob   = prob / numel(channel_uint8);
-    levels = 0:num_levels-1;
-
-    max_variance = 0;
-    t            = 0;
-
-    for thresh = 1:num_levels-1
-        w0 = sum(prob(1:thresh));
-        w1 = sum(prob(thresh+1:end));
-        if w0 == 0 || w1 == 0, continue; end
-
-        mu0 = sum(levels(1:thresh)     .* prob(1:thresh))     / w0;
-        mu1 = sum(levels(thresh+1:end) .* prob(thresh+1:end)) / w1;
-
-        inter_variance = w0 * w1 * (mu1 - mu0)^2;
-
-        if inter_variance > max_variance
-            max_variance = inter_variance;
-            t = thresh;
-        end
-    end
-
-    t = t / 255;
-end
-
-mask = cell(1, numImages);
-
-for i = 1:numImages
-    t_S     = otsu_threshold(S_smooth{i});
-    mask{i} = S_smooth{i} > t_S;
-end
-
-disp('Otsu thresholding complete.');
-
-%% =========================================================
-%  STEP 5: Remove Small Blobs
-%  =========================================================
-% Blobs below the median area of all detected components are more likely
-% noise than signal.
-mask_clean = cell(1, numImages);
-
-for i = 1:numImages
-    stats    = regionprops(mask{i}, 'Area');
-    allAreas = [stats.Area];
-
-    if isempty(allAreas)
-        mask_clean{i} = mask{i};
-        continue;
-    end
-
-    minBlobArea   = max(1, round(median(allAreas)));
-    mask_clean{i} = bwareaopen(mask{i}, minBlobArea);
-end
-
-disp('Small blob removal complete (median adaptive threshold).');
-
-%% =========================================================
-%  STEP 6: Fill Holes
-%  =========================================================
-% Parachute panels separated by darker seams appear as internal voids
-% after thresholding. Filling them produces one solid region per candidate,
-% making solidity and area measurements more reliable in the selection step.
-
-mask_filled = cell(1, numImages);
-
-for i = 1:numImages
-    mask_filled{i} = imfill(mask_clean{i}, 'holes');
-end
-
-disp('Hole filling complete.');
-
-%% =========================================================
-%  STEP 7: Blob Selection
-%  =========================================================
-% Multiple candidate blobs remain after thresholding. The parachute is
-% identified by scoring each blob on three criteria:
-%   - Mean saturation: parachute is the most colourful object (high S)
-%   - Solidity: parachute canopy is compact (high solidity)
-%   - Position: parachute is airborne - upper-half blobs score higher
+% CMP9135M Computer Vision — Assessment 2
+% main.m : feature extraction + object tracking on the parachute dataset.
 %
-% imopen removes thin protrusions from the selected blob while preserving
-% the compact core. SE radius scales to the blob's own minor axis length.
-
-mask_final = cell(1, numImages);
-
-for i = 1:numImages
-
-    BW       = mask_filled{i};
-    CC       = bwconncomp(BW);
-
-    if CC.NumObjects == 0
-        mask_final{i} = false(size(BW));
-        continue;
-    end
-
-    [rows, ~] = size(BW);
-    S         = S_smooth{i};
-    stats     = regionprops(CC, 'Solidity', 'PixelIdxList', 'Centroid');
-    numBlobs  = CC.NumObjects;
-
-    % Position weight derived from image geometry
-    img_half = rows / 2;  % geometric midpoint in pixels
-    full_w   = rows;      % maximum centroid distance from top
-
-    score = zeros(1, numBlobs);
-    for k = 1:numBlobs
-        pixels  = CC.PixelIdxList{k};
-        cy_px   = stats(k).Centroid(2);
-        pos_w   = full_w;
-        if cy_px >= img_half
-            pos_w = img_half;  % lower half - half weight
-        end
-        score(k) = mean(S(pixels)) * stats(k).Solidity * (pos_w / full_w);
-    end
-
-    [~, best_idx]  = max(score);
-    mask_final{i}  = false(size(BW));
-    mask_final{i}(CC.PixelIdxList{best_idx}) = true;
-
-    % SE radius derived from blob's own minor axis - scales to parachute size
-    stats_se  = regionprops(mask_final{i}, 'MinorAxisLength');
-    seRadius  = max(1, round(stats_se(1).MinorAxisLength * 0.1));
-    mask_final{i} = imopen(mask_final{i}, strel('disk', seRadius));
-
-end
-
-disp('Blob selection complete.');
-
-%% =========================================================
-%  STEP 8: H Variance Fallback
-%  =========================================================
-% In severely backlit scenes the parachute saturation drops below the
-% background level, causing S-based selection to pick the wrong blob.
-% The fallback computes local hue standard deviation: the parachute's
-% multicoloured stripes produce high H variance while uniform walls and
-% sky do not. Triggered when selected blob mean saturation falls below
-% 0.30 - the HSV boundary between achromatic and chromatic regions.
-
-grey_saturation_limit = 0.30;
-winSize               = 2 * round(sqrt(imgH)) + 1;  % neighbourhood scaled to image height
-
-for i = 1:numImages
-
-    BW              = mask_final{i};
-    S               = S_smooth{i};
-    selected_pixels = find(BW);
-
-    if isempty(selected_pixels), continue; end
-
-    mean_sat_selected = mean(S(selected_pixels));
-    if mean_sat_selected >= grey_saturation_limit, continue; end
-
-    H         = H_all{i};
-    hvar_map  = stdfilt(H, ones(winSize, winSize));
-    hvar_norm = hvar_map / (max(hvar_map(:)) + eps);
-    t_hvar    = otsu_threshold(hvar_norm);
-    mask_hvar = imfill(hvar_norm > t_hvar, 'holes');
-
-    CC_hvar = bwconncomp(mask_hvar);
-    if CC_hvar.NumObjects == 0, continue; end
-
-    stats_hvar    = regionprops(CC_hvar, 'Area', 'Solidity', 'Centroid', 'PixelIdxList');
-    [rows, ~]     = size(BW);
-    img_half      = rows / 2;
-    full_w        = rows;
-
-    % Minimum blob size derived from area distribution - filters trivial regions
-    hvar_areas    = [stats_hvar.Area];
-    min_hvar_area = max(1, round(median(hvar_areas) / numel(hvar_areas)));
-
-    score_hvar = zeros(1, CC_hvar.NumObjects);
-    for k = 1:CC_hvar.NumObjects
-        if stats_hvar(k).Area < min_hvar_area, continue; end
-        cy_px  = stats_hvar(k).Centroid(2);
-        pos_w  = full_w;
-        if cy_px >= img_half, pos_w = img_half; end
-        score_hvar(k) = stats_hvar(k).Solidity * (pos_w / full_w);
-    end
-
-    [best_score, best_hvar] = max(score_hvar);
-    if best_score > 0
-        mask_final{i} = false(size(BW));
-        mask_final{i}(CC_hvar.PixelIdxList{best_hvar}) = true;
-        fprintf('Image %02d: H variance fallback triggered (mean_sat=%.3f)\n', ...
-            i, mean_sat_selected);
-    end
-
-
-    if best_score > 0
-        mask_final{i} = false(size(BW));
-        mask_final{i}(CC_hvar.PixelIdxList{best_hvar}) = true;
-
-        % Contraction: remove low hue-variance pixels from selected blob
-        % Only applied here since fallback blobs tend to be oversized
-        hvar_blob  = hvar_norm(mask_final{i});
-        t_contract = otsu_threshold(reshape(hvar_blob, 1, []));
-        contracted = mask_final{i} & (hvar_norm > t_contract);
-        contracted = imfill(contracted, 'holes');
-        if sum(contracted(:)) > 0
-            mask_final{i} = contracted;
-        end
-
-        fprintf('Image %02d: H variance fallback triggered (mean_sat=%.3f)\n', ...
-            i, mean_sat_selected);
-    end
-
-end
-
-disp('H variance fallback complete.');
-
-%% =========================================================
-%  STEP 9: Region-Growing Refinement
-%  =========================================================
-% Distant parachutes occupy fewer pixels and are often under-segmented
-% by the global Otsu threshold. For blobs below the median blob area,
-% a local re-threshold is applied within an expanded bounding box to
-% recover missing boundary pixels.
+% Tools used in this file:
+%% Tool: GitHub CoPilot (free student version)
+%% Purpose: interactive code completion, e.g., function body skeletons,
+%%          variable and function names.
 %
-% Two safety checks guard against expanding into background:
-%   1. Refined blob must be strictly larger than the original.
-%   2. Refined blob mean saturation must stay within the original
-%      blob's own saturation spread (mean - std).
+% Run-order note: this script is self-contained. Execute from top to
+% bottom, or run individual %% cells after STEP 0 has been run once
+% (STEP 0 populates the workspace variables that later steps consume).
 
-mask_refined = cell(1, numImages);
+clc; clear; close all;
 
-% Refinement trigger: blobs below median area are likely under-segmented
-all_blob_areas = zeros(1, numImages);
-for i = 1:numImages
-    st = regionprops(mask_final{i}, 'Area');
-    if ~isempty(st)
-        all_blob_areas(i) = st(1).Area;
+% Reproducibility: any stochastic operation (e.g. random quarantine-set
+% selection) is seeded so results are identical across runs.
+rng(42);
+
+
+%% ============================================================
+%  STEP 0: Setup and data loading
+%  - Locate the parachute dataset (51 RGB + 51 GT masks).
+%  - Build a robust binary-mask extractor.
+%  - Declare the train / quarantine / test splits up front, BEFORE
+%    writing any feature or filter logic, so that no parameter is
+%    chosen by looking at data we later evaluate on.
+%% ============================================================
+
+% ---- 0.1  Dataset paths ------------------------------------------------
+% Adjust dataRoot if your unzipped dataset sits elsewhere.
+dataRoot = 'parachute';
+rgbDir   = fullfile(dataRoot, 'images');
+gtDir    = fullfile(dataRoot, 'GT');
+
+rgbList = dir(fullfile(rgbDir, '*.png'));
+gtList  = dir(fullfile(gtDir,  '*.png'));
+
+assert(~isempty(rgbList), 'No RGB images found in %s', rgbDir);
+assert(~isempty(gtList),  'No GT masks found in %s',  gtDir);
+assert(numel(rgbList) == numel(gtList), ...
+    'RGB (%d) and GT (%d) file counts must match.', ...
+    numel(rgbList), numel(gtList));
+
+% Natural-sort by the integer embedded in each filename so that
+% "frame_2.png" comes before "frame_10.png" regardless of zero-padding.
+rgbList = sortByEmbeddedNumber(rgbList);
+gtList  = sortByEmbeddedNumber(gtList);
+
+numFrames = numel(rgbList);
+fprintf('Found %d frame pairs in %s\n', numFrames, dataRoot);
+
+
+% ---- 0.2  Load images and extract binary masks -------------------------
+% Images may differ in spatial size across the sequence, so we store them
+% in cell arrays rather than a single numeric array.
+rgbImgs = cell(numFrames, 1);
+gtMasks = cell(numFrames, 1);
+
+for i = 1:numFrames
+    rgbImgs{i} = imread(fullfile(rgbList(i).folder, rgbList(i).name));
+    gtRaw      = imread(fullfile(gtList(i).folder,  gtList(i).name));
+    gtMasks{i} = extractMask(gtRaw);
+end
+
+fprintf('Loaded %d RGB frames and %d GT masks.\n', numFrames, numFrames);
+
+
+% ---- 0.3  Declare splits (before any analysis) -------------------------
+% The brief uses 0-indexed frame numbers; MATLAB indices are 1-based.
+%   Brief frames  0–40  <=>  MATLAB indices  1–41   (KF training)
+%   Brief frames 41–50  <=>  MATLAB indices 42–51   (KF evaluation)
+trainIdx = 1:41;
+testIdx  = 42:51;
+
+% Shape/HoG development quarantine: hold out 5 random frames so that no
+% feature-extraction parameter is ever tuned on them. Selected here,
+% before any feature logic exists, so the choice is independent of results.
+%
+% Why 5: ~10% of the 51 frames, in line with the standard 10–20% hold-out
+% convention. Smaller would give noisier confirmation statistics; larger
+% would shrink the development set below 80%, leaving fewer frames in which
+% to observe trajectory patterns. The number is therefore set by convention,
+% not chosen to produce any particular result.
+nQuarantine   = 5;
+quarantineIdx = sort(randperm(numFrames, nQuarantine));
+developIdx    = setdiff(1:numFrames, quarantineIdx);
+
+fprintf('KF  train indices (MATLAB) : %s\n', mat2str(trainIdx));
+fprintf('KF  test  indices (MATLAB) : %s\n', mat2str(testIdx));
+fprintf('Shape/HoG quarantine (1..%d): %s\n', numFrames, mat2str(quarantineIdx));
+
+
+% ---- 0.4  Sanity view: overlay masks on a few sample frames -----------
+% First, middle and last frames — chosen for visual coverage of the
+% sequence, not used by any subsequent computation. Display only.
+sampleIdx = unique([1, round(numFrames/2), numFrames]);
+figure('Name', 'STEP 0 sanity: mask overlay on RGB');
+tiledlayout(1, numel(sampleIdx), 'Padding', 'compact', 'TileSpacing', 'compact');
+for k = 1:numel(sampleIdx)
+    i = sampleIdx(k);
+    nexttile;
+    imshow(labeloverlay(rgbImgs{i}, gtMasks{i}, ...
+        'Colormap', [1 0 0], 'Transparency', 0.55));
+    title(sprintf('Frame %d  (brief idx %d)', i, i-1));
+end
+
+
+%% ============================================================
+%  STEP 1: Task 1(i) — Shape features
+%  For each GT mask compute four shape descriptors:
+%     solidity         = Area / ConvexArea                       in (0, 1]
+%     circularity      = 4*pi*Area / Perimeter^2                 in (0, 1]
+%     non_compactness  = 1 - circularity                         in [0, 1)
+%     eccentricity     = ellipse eccentricity of the region      in [0, 1)
+%  All four are scale- and translation-invariant, so they depend on
+%  the parachute's shape alone and not on where it sits in the frame.
+%% ============================================================
+
+% ---- 1.1  Compute the four features for every frame --------------------
+shapeFeatures = zeros(numFrames, 4);   % columns: [sol, nc, circ, ecc]
+shapeNames    = {'solidity', 'non-compactness', 'circularity', 'eccentricity'};
+
+for i = 1:numFrames
+    shapeFeatures(i, :) = computeShapeFeatures(gtMasks{i});
+end
+
+% Save as a table for readability (frame index column uses the brief's
+% 0-based numbering, which is how every plot/table in the report refers
+% to frames).
+shapeTable = array2table(shapeFeatures, 'VariableNames', ...
+    {'solidity', 'non_compactness', 'circularity', 'eccentricity'});
+shapeTable.frame = (0:numFrames-1)';
+shapeTable = movevars(shapeTable, 'frame', 'Before', 1);
+
+
+% ---- 1.2  Plot each feature's trajectory across the sequence -----------
+frames0 = 0:numFrames-1;                  % brief-numbered frame axis
+figure('Name', 'STEP 1: Shape-feature trajectories');
+tiledlayout(2, 2, 'Padding', 'compact', 'TileSpacing', 'compact');
+for j = 1:4
+    nexttile;
+    plot(frames0, shapeFeatures(:, j), '-o', 'LineWidth', 1.2, 'MarkerSize', 3);
+    grid on;
+    xlabel('frame index (brief numbering)');
+    ylabel(shapeNames{j});
+    title(shapeNames{j});
+end
+sgtitle('Shape features across the 51 parachute frames');
+
+
+% ---- 1.3  Summary statistics (develop set vs. quarantine) --------------
+% Reporting them separately is the evaluation-rigour practice from the
+% A01 feedback: any commentary we write about trajectories is grounded
+% in the development subset; the quarantine numbers are the independent
+% confirmation.
+fprintf('\n--- STEP 1: Shape-feature summary ---\n');
+fprintf('%-16s  %10s %10s  |  %10s %10s\n', ...
+    'feature', 'dev mean', 'dev std', 'qtn mean', 'qtn std');
+for j = 1:4
+    devVals = shapeFeatures(developIdx, j);
+    qtnVals = shapeFeatures(quarantineIdx, j);
+    fprintf('%-16s  %10.4f %10.4f  |  %10.4f %10.4f\n', ...
+        shapeNames{j}, mean(devVals), std(devVals), ...
+        mean(qtnVals), std(qtnVals));
+end
+
+% Expose for later cells / the discriminative analysis in STEP 3.
+clear j i devVals qtnVals
+
+
+%% ============================================================
+%  STEP 2: Task 1(ii) — HoG features (4 orientation bins)
+%  One HoG feature vector per image. The orientation histogram uses
+%  exactly four bins centred at 0°, 45°, 90°, 135° (per the brief).
+%
+%  Input image: the RGB image with the background suppressed by the
+%  GT mask, so HoG describes edges on the parachute itself rather
+%  than sky/cloud texture. (The brief notes that the masks "can be
+%  used to extract the corresponding areas from the RGB images".)
+%
+%  Cell size: derived from the parachute's bounding-box in each frame
+%  rather than a fixed pixel value. The DESIGN choice is "how many
+%  tiles cover the object" (TILES_ACROSS_OBJECT, conventionally 4
+%  following the SIFT 4×4 grid). The pixel cell size is a derived
+%  consequence of that choice and the object's apparent size.
+%% ============================================================
+
+% ---- 2.1  Compute HoG vectors for every frame --------------------------
+% TILES_ACROSS_OBJECT: SIFT-style 4×4 grid convention. Citable design
+% choice, NOT a tuned pixel value.
+TILES_ACROSS_OBJECT = 4;
+
+% MIN_CELL_PX: mathematical sanity floor. A 4-bin orientation histogram
+% built from fewer than ~4 gradient samples is statistically meaningless.
+% Below 2 px per cell each cell holds at most 4 gradients, so 2 is the
+% smallest cell size at which the histogram has any informational content.
+MIN_CELL_PX = 2;
+
+hogVectors = cell(numFrames, 1);     % HoG feature vector per frame
+hogCellSizes = zeros(numFrames, 1);  % the per-frame cell size actually used
+hogGridSizes = zeros(numFrames, 2);  % the per-frame [nRowsTiles nColsTiles]
+
+for i = 1:numFrames
+    [hogVectors{i}, hogCellSizes(i), hogGridSizes(i,:)] = ...
+        computeHoG4(rgbImgs{i}, gtMasks{i}, ...
+                    TILES_ACROSS_OBJECT, MIN_CELL_PX);
+end
+
+% Per-frame vector length (varies with bbox aspect ratio, since each cell
+% contributes 4 bins and the grid is m×n cells).
+hogLengths = cellfun(@numel, hogVectors);
+
+fprintf('\n--- STEP 2: HoG summary ---\n');
+fprintf('Cell size  (px)  : min=%d  median=%d  max=%d\n', ...
+    min(hogCellSizes), round(median(hogCellSizes)), max(hogCellSizes));
+fprintf('Grid (rows×cols) : median=%d × %d\n', ...
+    round(median(hogGridSizes(:,1))), round(median(hogGridSizes(:,2))));
+fprintf('Vector length    : min=%d  median=%d  max=%d\n', ...
+    min(hogLengths), round(median(hogLengths)), max(hogLengths));
+
+
+% ---- 2.2  Per-bin energy across the sequence ---------------------------
+% For each frame, sum the contributions in each of the four orientation
+% bins (0°, 45°, 90°, 135°). This collapses the variable-length per-frame
+% vectors into a fixed 51×4 matrix that's directly plottable, and answers
+% "how does the dominant edge orientation change across the sequence?".
+binEnergy = zeros(numFrames, 4);
+for i = 1:numFrames
+    v = hogVectors{i};
+    % Vector layout from computeHoG4: [c1_b1 c1_b2 c1_b3 c1_b4  c2_b1 ...]
+    % so reshaping into 4 rows groups all values from each bin together.
+    binEnergy(i, :) = sum(reshape(v, 4, []), 2)';
+end
+
+binNames = {'0°', '45°', '90°', '135°'};
+
+frames0 = 0:numFrames-1;
+figure('Name', 'STEP 2: HoG per-bin energy across the sequence');
+plot(frames0, binEnergy, '-o', 'LineWidth', 1.2, 'MarkerSize', 3);
+grid on; xlabel('frame index (brief numbering)');
+ylabel('summed bin energy (L2-normalised vector)');
+legend(binNames, 'Location', 'best');
+title('HoG: orientation-bin energy per frame');
+
+
+% ---- 2.3  Heatmap of full HoG vectors (zero-padded) --------------------
+% Different frames produce different-length vectors, so to visualise all
+% 51 side-by-side we zero-pad up to the longest. This is display-only.
+maxLen = max(hogLengths);
+H = zeros(numFrames, maxLen);
+for i = 1:numFrames
+    v = hogVectors{i};
+    H(i, 1:numel(v)) = v;
+end
+
+figure('Name', 'STEP 2: HoG vectors heatmap');
+imagesc(H); colormap parula; colorbar;
+xlabel('HoG vector index (zero-padded to max length)');
+ylabel('frame index (MATLAB 1-based)');
+title('HoG feature vectors — one row per frame');
+
+
+% ---- 2.4  Dev vs. quarantine summary -----------------------------------
+fprintf('\nHoG bin-energy summary (dev vs quarantine):\n');
+fprintf('%-6s  %10s %10s  |  %10s %10s\n', ...
+    'bin', 'dev mean', 'dev std', 'qtn mean', 'qtn std');
+for j = 1:4
+    devVals = binEnergy(developIdx, j);
+    qtnVals = binEnergy(quarantineIdx, j);
+    fprintf('%-6s  %10.4f %10.4f  |  %10.4f %10.4f\n', ...
+        binNames{j}, mean(devVals), std(devVals), ...
+        mean(qtnVals), std(qtnVals));
+end
+
+clear i j v devVals qtnVals maxLen H
+
+
+%% ============================================================
+%  STEP 3: Task 1(iii) — Discriminative comparison
+%% ============================================================
+
+% <placeholder — implemented in Phase 3>
+
+
+%% ============================================================
+%  STEP 4: Task 2 — Measurements from GT masks (centroid + angle)
+%% ============================================================
+
+% <placeholder — implemented in Phase 4>
+
+
+%% ============================================================
+%  STEP 5: Task 2 — Translation Kalman filter (from scratch)
+%% ============================================================
+
+% <placeholder — implemented in Phase 5>
+
+
+%% ============================================================
+%  STEP 6: Task 2 — Rotation Kalman filter (from scratch)
+%% ============================================================
+
+% <placeholder — implemented in Phase 6>
+
+
+%% ============================================================
+%  STEP 7: Results — tables and plots
+%% ============================================================
+
+% <placeholder — implemented in Phase 7>
+
+
+%% ============================================================
+%  Local helper functions
+%% ============================================================
+
+function [vec, cellPx, gridRC] = computeHoG4(rgbImg, mask, tilesAcross, minCellPx)
+% computeHoG4  HoG feature with 4 orientation bins (0/45/90/135°),
+% computed on the RGB image with the background suppressed by `mask`.
+%
+% INPUTS
+%   rgbImg      H×W×3 RGB image (uint8 or double).
+%   mask        H×W logical mask (true = parachute, false = background).
+%   tilesAcross design choice: number of HoG tiles across the object's
+%               smaller bounding-box side. Conventionally 4 (SIFT-style).
+%   minCellPx   sanity floor on cell side length, in pixels.
+%
+% OUTPUTS
+%   vec     1×N HoG feature vector, L2-normalised.
+%           Layout: cells in row-major order, four bins per cell, so
+%           vec = [c1_b1 c1_b2 c1_b3 c1_b4  c2_b1 c2_b2 ...].
+%   cellPx  scalar cell side length in pixels actually used.
+%   gridRC  [nRowsTiles nColsTiles] of the tile grid placed on the bbox.
+
+    % --- 1. Convert to greyscale double in [0,1] for gradient stability.
+    if size(rgbImg, 3) == 3
+        gImg = rgb2gray(rgbImg);
+    else
+        gImg = rgbImg;
     end
-end
-[imgH_r, imgW_r]   = size(mask_final{1});
-refinement_trigger = median(all_blob_areas(all_blob_areas > 0)) / (imgH_r * imgW_r);
+    gImg = im2double(gImg);
 
-for i = 1:numImages
+    % --- 2. Apply the mask: zero out background pixels so subsequent
+    % gradients only carry information about the parachute and its edge.
+    gImg(~mask) = 0;
 
-    BW           = mask_final{i};
-    S            = S_smooth{i};
-    [rows, cols] = size(BW);
-    stats        = regionprops(BW, 'Area', 'BoundingBox');
+    % --- 3. Crop to the parachute's bounding box. This makes the
+    % per-frame "image area for HoG" object-relative, so the same
+    % grid resolution covers the same fraction of the parachute in
+    % every frame regardless of where it sits or how large it appears.
+    stats = regionprops(bwareafilt(mask, 1), 'BoundingBox');
+    if isempty(stats)
+        vec = []; cellPx = NaN; gridRC = [0 0];
+        return;
+    end
+    bb = stats.BoundingBox;          % [x y width height], 0.5-offset
+    x0 = max(1, floor(bb(1)));
+    y0 = max(1, floor(bb(2)));
+    x1 = min(size(gImg, 2), x0 + ceil(bb(3)) - 1);
+    y1 = min(size(gImg, 1), y0 + ceil(bb(4)) - 1);
+    patch = gImg(y0:y1, x0:x1);
 
-    if isempty(stats) || stats(1).Area / (rows * cols) > refinement_trigger
-        mask_refined{i} = BW;
-        continue;
+    [hP, wP] = size(patch);
+
+    % --- 4. Choose cell size by dividing the SHORTER bbox side into
+    % `tilesAcross` tiles. Using the shorter side guarantees at least
+    % `tilesAcross` tiles in both dimensions; the longer side then gets
+    % more tiles, preserving the bbox aspect ratio in the grid.
+    cellPx = max(minCellPx, floor(min(hP, wP) / tilesAcross));
+
+    nRows = floor(hP / cellPx);
+    nCols = floor(wP / cellPx);
+    gridRC = [nRows, nCols];
+
+    if nRows < 1 || nCols < 1
+        vec = []; return;
     end
 
-    % Bounding box margin derived from blob extent - captures local context
-    bb     = stats(1).BoundingBox;
-    margin = round(min(bb(3), bb(4)) / 2);
-    x1 = max(1,    floor(bb(1)) - margin);
-    y1 = max(1,    floor(bb(2)) - margin);
-    x2 = min(cols, floor(bb(1) + bb(3)) + margin);
-    y2 = min(rows, floor(bb(2) + bb(4)) + margin);
+    % Trim the patch to an exact multiple of cellPx so the cells tile cleanly.
+    patch = patch(1:nRows*cellPx, 1:nCols*cellPx);
 
-    S_local    = S(y1:y2, x1:x2);
-    t_local    = 0.7 * otsu_threshold(S);
-    local_mask = S_local > t_local;
+    % --- 5. Image gradients via centred-difference filter [-1 0 1].
+    % This is the canonical HoG operator (Dalal & Triggs 2005).
+    fx = [-1 0 1];
+    fy = fx';
+    gx = imfilter(patch, fx, 'replicate');
+    gy = imfilter(patch, fy, 'replicate');
 
-    CC_local = bwconncomp(local_mask);
-    if CC_local.NumObjects == 0
-        mask_refined{i} = BW;
-        continue;
+    mag = sqrt(gx.^2 + gy.^2);
+
+    % Unsigned orientation in [0, 180): atan2 returns [-pi, pi]; mod by
+    % pi folds opposite directions onto each other (an edge running NE-SW
+    % and one running SW-NE are the same edge). Convert to degrees.
+    ori = mod(atan2(gy, gx), pi) * (180 / pi);   % in [0, 180)
+
+    % --- 6. Soft-assign each pixel's gradient to one of 4 bins centred
+    % at 0, 45, 90, 135 degrees (bin width = 45°). Hard-binning is fine
+    % here — soft (linear-interpolated) binning is a refinement we can
+    % add later if needed; for 4 bins the difference is small.
+    binWidth = 180 / 4;                                  % 45° per bin
+    binIdx   = floor(ori / binWidth) + 1;                % in {1,2,3,4}
+    binIdx(binIdx > 4) = 4;                              % safety cap
+
+    % --- 7. Accumulate magnitude into the (cell × bin) histogram.
+    % Vectorised over all pixels; for each pixel we know its cell row,
+    % cell column, and bin index, so a single accumarray call builds
+    % the entire (nRows × nCols × 4) histogram in one pass.
+    [pyIdx, pxIdx] = ndgrid(1:nRows*cellPx, 1:nCols*cellPx);
+    cellRow = ceil(pyIdx / cellPx);
+    cellCol = ceil(pxIdx / cellPx);
+
+    subs = [cellRow(:), cellCol(:), binIdx(:)];
+    hist3D = accumarray(subs, mag(:), [nRows, nCols, 4]);
+
+    % --- 8. Flatten in cell-row-major × bin order so the layout is
+    % [c1_b1 c1_b2 c1_b3 c1_b4  c2_b1 ...] — predictable and simple
+    % to slice when later analysis needs per-bin or per-cell views.
+    vec = reshape(permute(hist3D, [3 2 1]), 1, []);
+
+    % --- 9. L2-normalise the whole vector once. eps prevents division
+    % by zero on degenerate frames with no gradient (e.g. all-black).
+    vec = vec / (norm(vec) + eps);
+end
+
+
+function feats = computeShapeFeatures(mask)
+% computeShapeFeatures  Return [solidity, non_compactness, circularity,
+% eccentricity] for the foreground region of a binary mask.
+%
+% Formulae (definitions, not tuned values — all dimensionless,
+% scale- and translation-invariant):
+%   solidity        = Area / ConvexArea
+%   circularity     = 4*pi*Area / Perimeter^2          (max = 1, perfect disc)
+%   non_compactness = 1 - circularity
+%   eccentricity    = sqrt(1 - (minor/major)^2)        (ellipse eccentricity)
+%
+% Domain assumption: the dataset contains a single object of interest
+% (the parachute), so when the mask has multiple disconnected components
+% we keep only the largest — the others are segmentation artefacts.
+    mask = logical(mask);
+    if ~any(mask(:))
+        feats = [NaN NaN NaN NaN];
+        return;
     end
 
-    local_stats  = regionprops(CC_local, 'Area', 'PixelIdxList');
-    [~, best]    = max([local_stats.Area]);
-    refined_full = false(rows, cols);
-    patch        = false(y2-y1+1, x2-x1+1);
-    patch(CC_local.PixelIdxList{best}) = true;
-    refined_full(y1:y2, x1:x2) = patch;
+    % Keep the largest connected component. The "1" comes from the domain
+    % (one parachute per frame), not from tuning.
+    mask = bwareafilt(mask, 1);
 
-    % Safety check 1: refined mask must be larger than original
-    if sum(refined_full(:)) <= sum(BW(:))
-        mask_refined{i} = BW;
-        continue;
+    stats = regionprops(mask, ...
+        'Area', 'Perimeter', 'ConvexArea', 'Eccentricity');
+
+    A  = stats.Area;
+    P  = stats.Perimeter;
+    Ac = stats.ConvexArea;
+    ecc = stats.Eccentricity;
+
+    % Division-by-zero guard for degenerate masks (single-pixel regions
+    % have zero perimeter under MATLAB's estimator).
+    if P > 0
+        circ = 4 * pi * A / (P^2);
+    else
+        circ = 0;
     end
 
-    % Safety check 2: refined saturation must stay within blob's own spread
-    orig_pixels      = S(find(BW));                 %#ok<FNDSB>
-    orig_mean_sat    = mean(orig_pixels);
-    orig_std_sat     = std(orig_pixels);
-    refined_mean_sat = mean(S(find(refined_full))); %#ok<FNDSB>
+    % Mathematical clamp: circularity is provably <= 1 for any planar
+    % region (isoperimetric inequality). MATLAB's discrete perimeter
+    % estimator can numerically overshoot by a fraction of a percent on
+    % small regions, so we cap to the theoretical bound. The "1" here is
+    % the bound itself, not a tuned threshold.
+    circ = min(circ, 1);
 
-    if refined_mean_sat < orig_mean_sat - orig_std_sat
-        mask_refined{i} = BW;
-        continue;
+    sol = A / Ac;
+    nc  = 1 - circ;
+
+    feats = [sol, nc, circ, ecc];
+end
+
+
+function mask = extractMask(gtImg)
+% extractMask  Convert a GT image (either indexed 2-D or RGB "visual"
+% version) into a binary parachute mask.
+%
+% Convention used across this submission:
+%     background = 0 (black in either representation)
+%     foreground = any non-zero pixel
+% The dataset contains a single object of interest (the parachute),
+% so collapsing all non-zero labels/colours to TRUE is correct and
+% works for both the indexed PNG and the RGB-convenience PNG.
+    if ndims(gtImg) == 3
+        mask = any(gtImg ~= 0, 3);   % RGB: non-black anywhere in RGB
+    else
+        mask = gtImg > 0;            % indexed/greyscale: non-zero label
     end
-
-    mask_refined{i} = refined_full;
-
-end
-
-disp('Region-growing refinement complete.');
-
-%% =========================================================
-%  STEP 10: Dice Score Calculation
-%  =========================================================
-% DSC = 2|pred ∩ gt| / (|pred| + |gt|)
-% Ground truth loads as RGB - channel 1 extracted and cast to logical.
-
-dice_scores = zeros(1, numImages);
-
-for i = 1:numImages
-    gt             = logical(Y{i}(:,:,1));
-    pred           = mask_refined{i};
-    intersection   = sum(pred(:) & gt(:));
-    dice_scores(i) = 2 * intersection / (sum(pred(:)) + sum(gt(:)));
-end
-
-mean_dice = mean(dice_scores);
-std_dice  = std(dice_scores);
-min_dice  = min(dice_scores);
-max_dice  = max(dice_scores);
-
-fprintf('\n========== RESULTS ==========\n');
-for i = 1:numImages
-    fprintf('Image %02d: DSC = %.4f\n', i, dice_scores(i));
-end
-fprintf('------------------------------\n');
-fprintf('Mean DSC   : %.4f\n', mean_dice);
-fprintf('Std  DSC   : %.4f\n', std_dice);
-fprintf('Min  DSC   : %.4f  (Image %d)\n', min_dice, find(dice_scores == min_dice, 1));
-fprintf('Max  DSC   : %.4f  (Image %d)\n', max_dice, find(dice_scores == max_dice, 1));
-fprintf('Above 0.90 : %d / %d\n', sum(dice_scores >= 0.90), numImages);
-fprintf('Above 0.80 : %d / %d\n', sum(dice_scores >= 0.80), numImages);
-fprintf('==============================\n');
-
-%% =========================================================
-%  STEP 11: Results Bar Chart
-%  =========================================================
-
-figure('Name', 'Figure 3 - DSC Results');
-bar(dice_scores, 'FaceColor', [0.22 0.48 0.74], 'EdgeColor', 'none');
-hold on;
-yline(mean_dice, 'r:', 'LineWidth', 1.2);
-hold off;
-xlabel('Image Index');
-ylabel('Dice Similarity Coefficient');
-title(['Parachute Segmentation - DSC per Image  |  Mean = ' num2str(mean_dice, '%.3f')]);
-ylim([0 1]);
-xlim([0 numImages + 1]);
-grid on;
-
-%% =========================================================
-%  STEP 12: Five Best and Five Worst Segmentation Results
-%  =========================================================
-
-[~, sorted_idx] = sort(dice_scores, 'descend');
-best_five  = sorted_idx(1:5);
-worst_five = sorted_idx(end-4:end);
-
-% --- Five Best Results ---
-for j = 1:5
-    idx = best_five(j);
-    figure('Name', ['Best ' num2str(j) ' - Image ' num2str(idx)]);
-    set(gcf, 'Color', 'w');
-    subplot(1,3,1); imshow(mask_refined{idx}); axis tight; axis image;
-    title('Predicted', 'FontSize', 8, 'Color', 'k');
-    subplot(1,3,2); imshow(logical(Y{idx}(:,:,1))); axis tight; axis image;
-    title(['Best #' num2str(j) ' - Image ' num2str(idx) '  |  DSC = ' num2str(dice_scores(idx), '%.4f')], 'FontSize', 8, 'Color', 'k');
-    subplot(1,3,3); imshowpair(mask_refined{idx}, logical(Y{idx}(:,:,1))); axis tight; axis image;
-    title('Overlay', 'FontSize', 8, 'Color', 'k');
-end
-
-% --- Five Worst Results ---
-for j = 1:5
-    idx = worst_five(j);
-    figure('Name', ['Worst ' num2str(j) ' - Image ' num2str(idx)]);
-    set(gcf, 'Color', 'w');
-    subplot(1,3,1); imshow(mask_refined{idx}); axis tight; axis image;
-    title('Predicted', 'FontSize', 8, 'Color', 'k');
-    subplot(1,3,2); imshow(logical(Y{idx}(:,:,1))); axis tight; axis image;
-    title(['Worst #' num2str(j) ' - Image ' num2str(idx) '  |  DSC = ' num2str(dice_scores(idx), '%.4f')], 'FontSize', 8, 'Color', 'k');
-    subplot(1,3,3); imshowpair(mask_refined{idx}, logical(Y{idx}(:,:,1))); axis tight; axis image;
-    title('Overlay', 'FontSize', 8, 'Color', 'k');
+    mask = logical(mask);
 end
 
 
-
-
-
+function lst = sortByEmbeddedNumber(lst)
+% sortByEmbeddedNumber  Sort a struct array from dir() by the first
+% integer found inside each filename. Falls back to plain lexical
+% order if any filename lacks an integer (still deterministic).
+    names = {lst.name};
+    nums  = nan(1, numel(names));
+    for k = 1:numel(names)
+        tok = regexp(names{k}, '\d+', 'match', 'once');
+        if ~isempty(tok)
+            nums(k) = str2double(tok);
+        end
+    end
+    if all(~isnan(nums))
+        [~, order] = sort(nums);
+    else
+        [~, order] = sort(names);
+    end
+    lst = lst(order);
+end

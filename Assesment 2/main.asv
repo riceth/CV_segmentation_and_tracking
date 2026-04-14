@@ -1,0 +1,296 @@
+% CMP9135M Computer Vision — Assessment 2
+% main.m : feature extraction + object tracking on the parachute dataset.
+%
+% Tools used in this file:
+%% Tool: GitHub CoPilot (free student version)
+%% Purpose: interactive code completion, e.g., function body skeletons,
+%%          variable and function names.
+%
+% Run-order note: this script is self-contained. Execute from top to
+% bottom, or run individual %% cells after STEP 0 has been run once
+% (STEP 0 populates the workspace variables that later steps consume).
+
+clc; clear; close all;
+
+% Reproducibility: any stochastic operation (e.g. random quarantine-set
+% selection) is seeded so results are identical across runs.
+rng(42);
+
+
+%% ============================================================
+%  STEP 0: Setup and data loading
+%  - Locate the parachute dataset (51 RGB + 51 GT masks).
+%  - Build a robust binary-mask extractor.
+%  - Declare the train / quarantine / test splits up front, BEFORE
+%    writing any feature or filter logic, so that no parameter is
+%    chosen by looking at data we later evaluate on.
+%% ============================================================
+
+% ---- 0.1  Dataset paths ------------------------------------------------
+% Adjust dataRoot if your unzipped dataset sits elsewhere.
+dataRoot = 'parachute';
+rgbDir   = fullfile(dataRoot, 'images');
+gtDir    = fullfile(dataRoot, 'GT');
+
+rgbList = dir(fullfile(rgbDir, '*.png'));
+gtList  = dir(fullfile(gtDir,  '*.png'));
+
+assert(~isempty(rgbList), 'No RGB images found in %s', rgbDir);
+assert(~isempty(gtList),  'No GT masks found in %s',  gtDir);
+assert(numel(rgbList) == numel(gtList), ...
+    'RGB (%d) and GT (%d) file counts must match.', ...
+    numel(rgbList), numel(gtList));
+
+% Natural-sort by the integer embedded in each filename so that
+% "frame_2.png" comes before "frame_10.png" regardless of zero-padding.
+rgbList = sortByEmbeddedNumber(rgbList);
+gtList  = sortByEmbeddedNumber(gtList);
+
+numFrames = numel(rgbList);
+fprintf('Found %d frame pairs in %s\n', numFrames, dataRoot);
+
+
+% ---- 0.2  Load images and extract binary masks -------------------------
+% Images may differ in spatial size across the sequence, so we store them
+% in cell arrays rather than a single numeric array.
+rgbImgs = cell(numFrames, 1);
+gtMasks = cell(numFrames, 1);
+
+for i = 1:numFrames
+    rgbImgs{i} = imread(fullfile(rgbList(i).folder, rgbList(i).name));
+    gtRaw      = imread(fullfile(gtList(i).folder,  gtList(i).name));
+    gtMasks{i} = extractMask(gtRaw);
+end
+
+fprintf('Loaded %d RGB frames and %d GT masks.\n', numFrames, numFrames);
+
+
+% ---- 0.3  Declare splits (before any analysis) -------------------------
+% The brief uses 0-indexed frame numbers; MATLAB indices are 1-based.
+%   Brief frames  0–40  <=>  MATLAB indices  1–41   (KF training)
+%   Brief frames 41–50  <=>  MATLAB indices 42–51   (KF evaluation)
+trainIdx = 1:41;
+testIdx  = 42:51;
+
+% Shape/HoG development quarantine: hold out 5 random frames so that no
+% feature-extraction parameter is ever tuned on them. Selected here,
+% before any feature logic exists, so the choice is independent of results.
+nQuarantine   = 5;
+quarantineIdx = sort(randperm(numFrames, nQuarantine));
+developIdx    = setdiff(1:numFrames, quarantineIdx);
+
+fprintf('KF  train indices (MATLAB) : %s\n', mat2str(trainIdx));
+fprintf('KF  test  indices (MATLAB) : %s\n', mat2str(testIdx));
+fprintf('Shape/HoG quarantine (1..%d): %s\n', numFrames, mat2str(quarantineIdx));
+
+
+% ---- 0.4  Sanity view: overlay masks on a few sample frames -----------
+sampleIdx = unique([1, round(numFrames/2), numFrames]);
+figure('Name', 'STEP 0 sanity: mask overlay on RGB');
+tiledlayout(1, numel(sampleIdx), 'Padding', 'compact', 'TileSpacing', 'compact');
+for k = 1:numel(sampleIdx)
+    i = sampleIdx(k);
+    nexttile;
+    imshow(labeloverlay(rgbImgs{i}, gtMasks{i}, ...
+        'Colormap', [1 0 0], 'Transparency', 0.55));
+    title(sprintf('Frame %d  (brief idx %d)', i, i-1));
+end
+
+
+%% ============================================================
+%  STEP 1: Task 1(i) — Shape features
+%  For each GT mask compute four shape descriptors:
+%     solidity         = Area / ConvexArea                       in (0, 1]
+%     circularity      = 4*pi*Area / Perimeter^2                 in (0, 1]
+%     non_compactness  = 1 - circularity                         in [0, 1)
+%     eccentricity     = ellipse eccentricity of the region      in [0, 1)
+%  All four are scale- and translation-invariant, so they depend on
+%  the parachute's shape alone and not on where it sits in the frame.
+%% ============================================================
+
+% ---- 1.1  Compute the four features for every frame --------------------
+shapeFeatures = zeros(numFrames, 4);   % columns: [sol, nc, circ, ecc]
+shapeNames    = {'solidity', 'non-compactness', 'circularity', 'eccentricity'};
+
+for i = 1:numFrames
+    shapeFeatures(i, :) = computeShapeFeatures(gtMasks{i});
+end
+
+% Save as a table for readability (frame index column uses the brief's
+% 0-based numbering, which is how every plot/table in the report refers
+% to frames).
+shapeTable = array2table(shapeFeatures, 'VariableNames', ...
+    {'solidity', 'non_compactness', 'circularity', 'eccentricity'});
+shapeTable.frame = (0:numFrames-1)';
+shapeTable = movevars(shapeTable, 'frame', 'Before', 1);
+
+
+% ---- 1.2  Plot each feature's trajectory across the sequence -----------
+frames0 = 0:numFrames-1;                  % brief-numbered frame axis
+figure('Name', 'STEP 1: Shape-feature trajectories');
+tiledlayout(2, 2, 'Padding', 'compact', 'TileSpacing', 'compact');
+for j = 1:4
+    nexttile;
+    plot(frames0, shapeFeatures(:, j), '-o', 'LineWidth', 1.2, 'MarkerSize', 3);
+    grid on;
+    xlabel('frame index (brief numbering)');
+    ylabel(shapeNames{j});
+    title(shapeNames{j});
+end
+sgtitle('Shape features across the 51 parachute frames');
+
+
+% ---- 1.3  Summary statistics (develop set vs. quarantine) --------------
+% Reporting them separately is the evaluation-rigour practice from the
+% A01 feedback: any commentary we write about trajectories is grounded
+% in the development subset; the quarantine numbers are the independent
+% confirmation.
+fprintf('\n--- STEP 1: Shape-feature summary ---\n');
+fprintf('%-16s  %10s %10s  |  %10s %10s\n', ...
+    'feature', 'dev mean', 'dev std', 'qtn mean', 'qtn std');
+for j = 1:4
+    devVals = shapeFeatures(developIdx, j);
+    qtnVals = shapeFeatures(quarantineIdx, j);
+    fprintf('%-16s  %10.4f %10.4f  |  %10.4f %10.4f\n', ...
+        shapeNames{j}, mean(devVals), std(devVals), ...
+        mean(qtnVals), std(qtnVals));
+end
+
+% Expose for later cells / the discriminative analysis in STEP 3.
+clear j i devVals qtnVals
+
+
+%% ============================================================
+%  STEP 2: Task 1(ii) — HoG features (4 orientation bins)
+%% ============================================================
+
+% <placeholder — implemented in Phase 2>
+
+
+%% ============================================================
+%  STEP 3: Task 1(iii) — Discriminative comparison
+%% ============================================================
+
+% <placeholder — implemented in Phase 3>
+
+
+%% ============================================================
+%  STEP 4: Task 2 — Measurements from GT masks (centroid + angle)
+%% ============================================================
+
+% <placeholder — implemented in Phase 4>
+
+
+%% ============================================================
+%  STEP 5: Task 2 — Translation Kalman filter (from scratch)
+%% ============================================================
+
+% <placeholder — implemented in Phase 5>
+
+
+%% ============================================================
+%  STEP 6: Task 2 — Rotation Kalman filter (from scratch)
+%% ============================================================
+
+% <placeholder — implemented in Phase 6>
+
+
+%% ============================================================
+%  STEP 7: Results — tables and plots
+%% ============================================================
+
+% <placeholder — implemented in Phase 7>
+
+
+%% ============================================================
+%  Local helper functions
+%% ============================================================
+
+function feats = computeShapeFeatures(mask)
+% computeShapeFeatures  Return [solidity, non_compactness, circularity,
+% eccentricity] for the foreground region of a binary mask.
+%
+% Formulae (all dimensionless, scale- and translation-invariant):
+%   solidity        = Area / ConvexArea
+%   circularity     = 4*pi*Area / Perimeter^2
+%   non_compactness = 1 - circularity
+%   eccentricity    = sqrt(1 - (minor/major)^2)   (ellipse eccentricity)
+%
+% If the mask has multiple disconnected components, we measure the
+% largest one — the parachute is a single object so any extra blobs
+% are segmentation artefacts, not separate targets.
+    mask = logical(mask);
+    if ~any(mask(:))
+        feats = [NaN NaN NaN NaN];
+        return;
+    end
+
+    % Keep only the largest connected component. bwareafilt picks the
+    % one with the greatest pixel count, so small isolated noise blobs
+    % (if any) are discarded before measurement.
+    mask = bwareafilt(mask, 1);
+
+    stats = regionprops(mask, ...
+        'Area', 'Perimeter', 'ConvexArea', 'Eccentricity');
+
+    A = stats.Area;
+    P = stats.Perimeter;
+    Ac = stats.ConvexArea;
+    ecc = stats.Eccentricity;
+
+    % Guard against pathological regions where Perimeter is 0
+    % (e.g. a single-pixel mask) to avoid division-by-zero.
+    if P > 0
+        circ = 4 * pi * A / (P^2);
+    else
+        circ = 0;
+    end
+    % circularity is mathematically capped at 1 (perfect disc); numerical
+    % perimeter estimators can overshoot slightly, so clamp for safety.
+    circ = min(circ, 1);
+
+    sol  = A / Ac;
+    nc   = 1 - circ;
+
+    feats = [sol, nc, circ, ecc];
+end
+
+
+function mask = extractMask(gtImg)
+% extractMask  Convert a GT image (either indexed 2-D or RGB "visual"
+% version) into a binary parachute mask.
+%
+% Convention used across this submission:
+%     background = 0 (black in either representation)
+%     foreground = any non-zero pixel
+% The dataset contains a single object of interest (the parachute),
+% so collapsing all non-zero labels/colours to TRUE is correct and
+% works for both the indexed PNG and the RGB-convenience PNG.
+    if ndims(gtImg) == 3
+        mask = any(gtImg ~= 0, 3);   % RGB: non-black anywhere in RGB
+    else
+        mask = gtImg > 0;            % indexed/greyscale: non-zero label
+    end
+    mask = logical(mask);
+end
+
+
+function lst = sortByEmbeddedNumber(lst)
+% sortByEmbeddedNumber  Sort a struct array from dir() by the first
+% integer found inside each filename. Falls back to plain lexical
+% order if any filename lacks an integer (still deterministic).
+    names = {lst.name};
+    nums  = nan(1, numel(names));
+    for k = 1:numel(names)
+        tok = regexp(names{k}, '\d+', 'match', 'once');
+        if ~isempty(tok)
+            nums(k) = str2double(tok);
+        end
+    end
+    if all(~isnan(nums))
+        [~, order] = sort(nums);
+    else
+        [~, order] = sort(names);
+    end
+    lst = lst(order);
+end
