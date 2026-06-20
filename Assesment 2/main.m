@@ -61,7 +61,6 @@ fprintf('Loaded %d RGB frames and %d GT masks.\n', numFrames, numFrames);
 
 
 % ---- 0.3  Declare splits (before any analysis) -------------------------
-% The brief uses 0-indexed frame numbers; MATLAB indices are 1-based.
 %   Brief frames  0–40  <=>  MATLAB indices  1–41   (KF training)
 %   Brief frames 41–50  <=>  MATLAB indices 42–51   (KF evaluation)
 trainIdx = 1:41;
@@ -72,10 +71,7 @@ testIdx  = 42:51;
 % before any feature logic exists, so the choice is independent of results.
 %
 % Why 5: ~10% of the 51 frames, in line with the standard 10–20% hold-out
-% convention. Smaller would give noisier confirmation statistics; larger
-% would shrink the development set below 80%, leaving fewer frames in which
-% to observe trajectory patterns. The number is therefore set by convention,
-% not chosen to produce any particular result.
+% convention. 
 nQuarantine   = 5;
 quarantineIdx = sort(randperm(numFrames, nQuarantine));
 developIdx    = setdiff(1:numFrames, quarantineIdx);
@@ -144,8 +140,7 @@ sgtitle('Shape features across the 51 parachute frames');
 
 
 % ---- 1.3  Summary statistics (develop set vs. quarantine) --------------
-% Reporting them separately is the evaluation-rigour practice from the
-% A01 feedback: any commentary we write about trajectories is grounded
+% any commentary we write about trajectories is grounded
 % in the development subset; the quarantine numbers are the independent
 % confirmation.
 fprintf('\n--- STEP 1: Shape-feature summary ---\n');
@@ -308,15 +303,6 @@ covDev = std(allFeatures(developIdx, :), 0, 1) ./ ...
 covQtn = std(allFeatures(quarantineIdx, :), 0, 1) ./ ...
          (abs(mean(allFeatures(quarantineIdx, :), 1)) + eps);
 
-% ---- 3.3  Monotonic-trend strength (Spearman ρ vs frame index) ---------
-% Spearman correlation = Pearson correlation on the *ranks* of the data.
-% Captures any monotonic trend (linear or curved) without assuming a
-% specific functional form. We report magnitude because direction (up
-% vs down) is just whether the feature increases or decreases across
-% the sequence — for "is there a trend?" only the strength matters.
-%
-% Implemented via base-MATLAB corrcoef on tiedrank(...) so this script
-% does not require the Statistics & Machine Learning Toolbox.
 trendDev = zeros(1, nFeat);
 trendQtn = zeros(1, nFeat);
 for k = 1:nFeat
@@ -336,8 +322,7 @@ end
 
 % ---- 3.5  Visualise the comparison -------------------------------------
 % Two grouped bar charts side by side: one for CoV, one for trend
-% strength. Dev vs quarantine bars per feature so the marker can see at
-% a glance that the comparison generalises beyond the development set.
+% strength. Dev vs quarantine bars per feature.
 figure('Name', 'STEP 3: Feature comparison (CoV and trend strength)');
 tiledlayout(1, 2, 'Padding', 'compact', 'TileSpacing', 'compact');
 
@@ -503,7 +488,7 @@ plot(centroids(trainIdx, 1), centroids(trainIdx, 2), 'o', ...
 plot(centroids(testIdx,  1), centroids(testIdx,  2), 's', ...
      'MarkerSize', 5, 'MarkerFaceColor', [1 0 0], 'MarkerEdgeColor', 'none');
 legend({'path', 'train (0–40)', 'test (41–50)'}, ...
-       'Location', 'best', 'TextColor', 'w');
+       'Location', 'best', 'TextColor', 'k');
 title('Centroid trajectory');
 hold off;
 
@@ -626,21 +611,6 @@ vel_train_y = diff(cy_train);           % empirical vy
 accel_x     = diff(vel_train_x);        % frame-to-frame vx change
 accel_y     = diff(vel_train_y);        % frame-to-frame vy change
 
-% Symmetric 4×4 process-noise covariance: standard discrete-time
-% constant-velocity Q parameterisation with per-axis process-noise
-% variance sigma_a^2 (the variance of the velocity change).
-%
-%          [ dt^4/4   0        dt^3/2   0      ]
-%   Q =    [ 0        dt^4/4   0        dt^3/2 ] * sigma_a^2
-%          [ dt^3/2   0        dt^2     0      ]
-%          [ 0        dt^3/2   0        dt^2   ]
-%
-% Mixing x and y axes is zero because the noise drives each axis
-% independently. With dt = 1, only the sigma_a^2 values remain — and we
-% allow them to differ between x and y because the Step-4 plot showed
-% x-motion was cleaner than y-motion (mild slope change around frame 30
-% + early dip in frames 0–5). Letting Q reflect that asymmetry is part
-% of deriving Q from the data rather than assuming isotropy.
 sigma_ax2 = var(accel_x);
 sigma_ay2 = var(accel_y);
 
@@ -739,7 +709,7 @@ plot(kfCentroids(testIdx, 1),  kfCentroids(testIdx, 2), 's', ...
      'MarkerEdgeColor', 'none', 'DisplayName', 'KF prediction (test)');
 plot(centroids(:,1), centroids(:,2), '-', 'LineWidth', 0.7, ...
      'Color', [1 0.6 0], 'DisplayName', 'GT centroid');
-legend('Location', 'best', 'TextColor', 'w');
+legend('Location', 'best', 'TextColor', 'k');
 title('Centroid trajectory — measured vs filtered');
 hold off;
 
